@@ -194,5 +194,4 @@ runs forward from it.
 
 ## License
 
-GPL-3.0-or-later, the same as Klipper. Add the full license text as `LICENSE` (GitHub
-offers it when you create the repository).
+GPL-3.0-or-later, the same as Klipper. See [LICENSE](LICENSE).
