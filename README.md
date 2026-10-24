@@ -54,8 +54,8 @@ different approach:
    So the search runs from shortly before the logged position to the end of the layer.
 5. **Recover the babystep.** `measured Z − layer Z` = the `SET_GCODE_OFFSET` that was
    active. The resume file re-applies it and resets it at the end.
-6. **Build the resume file** in a hidden folder (`gcodes/.power_loss/`), so it can't be
-   deleted by mistake. The file:
+6. **Build the resume file** in its own folder (`gcodes/power_loss/`), where you can
+   see it in Mainsail. The last measurement is saved in `config/lost_z.json`. The file:
    1. checks the printer is homed
    2. sets the offset
    3. heats bed and nozzle while parked in a corner

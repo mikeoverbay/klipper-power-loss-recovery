@@ -5,8 +5,8 @@
 # (so it lets go of the plastic), lifts a little, homes X, Y and Z, and counts each
 # motor's steps from the power-up spot to its endstop. Steps x step distance + the
 # homed position = where the nozzle was. MAKE_RESUME_FILE (lost_z_make_resume.py)
-# then finds the exact move it stopped on and writes a resume file into a hidden
-# folder; START_RESUME_FILE prints it. RESUME_AFTER_POWER_LOSS does all of it with
+# then finds the exact move it stopped on and writes a resume file into the
+# gcodes/power_loss folder; START_RESUME_FILE prints it. RESUME_AFTER_POWER_LOSS does all of it with
 # one confirmation popup (Mainsail action:prompt dialogs).
 #
 # Config:
@@ -15,7 +15,8 @@
 #   park_x: 0               # optional X/Y to home Z at (must be clear of the part)
 #   park_y: 0
 #   min_nozzle_temp: 170    # heat to at least this before anything moves (0 = off)
-#   resume_dir: .power_loss # hidden folder under gcodes for resume files
+#   resume_dir: power_loss  # folder under gcodes for resume files
+#   state_file: ~/printer_data/config/lost_z.json  # last measurement (shown in Mainsail)
 #   hold_homing_time: 7200  # idle timeout (s) held between recovery and resuming
 #
 # Copyright (C) 2026 mikeoverbay
@@ -31,14 +32,14 @@ class LostZ:
         self.park_y = config.getfloat('park_y', None)
         self.min_temp = config.getfloat('min_nozzle_temp', 170., minval=0.)
         self.state_file = os.path.expanduser(
-            config.get('state_file', '~/printer_data/lost_z.json'))
+            config.get('state_file', '~/printer_data/config/lost_z.json'))
         self.gcode_dir = os.path.expanduser(
             config.get('gcode_dir', '~/printer_data/gcodes'))
         self.resume_script = os.path.join(os.path.dirname(
             os.path.realpath(__file__)), 'lost_z_make_resume.py')
-        # Resume files go in a hidden folder so they don't get deleted by
-        # mistake; START_RESUME_FILE prints them.
-        self.resume_dir = config.get('resume_dir', '.power_loss')
+        # Resume files go in their own folder under gcodes, so they're easy to
+        # find and don't mix with the slicer files; START_RESUME_FILE prints them.
+        self.resume_dir = config.get('resume_dir', 'power_loss')
         # Between RECOVER and starting the resume, don't let the idle timeout
         # switch the motors off (that loses homing).
         self.hold_time = config.getfloat('hold_homing_time', 7200., minval=600.)

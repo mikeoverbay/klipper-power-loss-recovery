@@ -224,7 +224,7 @@ def main():
     ap.add_argument('--name', help="save as this file name instead of <file>_resume.gcode")
     ap.add_argument('--log-dir', default=os.path.expanduser('~/printer_data/logs'))
     ap.add_argument('--out-dir', default='',
-                    help="folder under the gcodes folder to save into (e.g. .power_loss)")
+                    help="folder under the gcodes folder to save into (e.g. power_loss)")
     ap.add_argument('--idle-timeout', type=float,
                     help="normal idle timeout to restore at the end of the resume")
     ap.add_argument('--no-log', dest='use_log', action='store_false',
