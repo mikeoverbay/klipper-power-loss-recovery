@@ -70,6 +70,30 @@ A measurement is only "fresh" until the next print starts, so an old crash's
 measurement can't be reused by mistake. Pressing the button again before printing
 won't re-measure the parked corner.
 
+### Unsaved Z offsets (babysteps)
+
+A babystep made during a print (Mainsail's Z +/- buttons, `SET_GCODE_OFFSET`) lives
+only in memory. A power cut or restart wipes it, so without help the resume would
+come back at the wrong squish. Nothing is saved during the print; it is worked out
+afterwards:
+
+1. **Measured Z is the real nozzle height**, babystep included - it comes from the
+   Z motor steps, and the lead screws don't move when the power goes.
+2. **The G-code gives the height it should have been**: the layer (from the logged
+   file position) and that layer's Z, e.g. 12.40.
+3. **The difference is the babystep**: measured 12.35 − layer 12.40 = −0.05.
+4. **Clean-up**: rounded to 0.005 mm (Mainsail's smallest babystep, and about the
+   measuring accuracy) and only accepted if it's a believable babystep - up to ±1 mm
+   when the log gives the layer, ±0.15 mm when the layer had to be guessed from the
+   height (a bigger difference could then just mean the wrong layer).
+
+The resume file sends `SET_GCODE_OFFSET Z=<offset>` before it prints and resets it
+to 0 at the end, so the next print doesn't inherit it.
+
+A **saved** Z offset (`Z_OFFSET_APPLY_ENDSTOP` / `SAVE_CONFIG`) needs nothing extra:
+it is part of the endstop position, so homing already includes it, and the
+measurement only finds the unsaved part on top.
+
 ## Requirements
 
 - **Klipper + Moonraker**, and **Mainsail** for the popups (any client that supports
