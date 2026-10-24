@@ -419,6 +419,7 @@ class LostZ:
         self._prompt([
             "action:prompt_begin %s" % (title,),
             "action:prompt_text Print: %s (%s)" % (info['file'], which),
+            "action:prompt_text Sliced with: %s" % (info.get('slicer', 'unknown slicer'),),
             "action:prompt_text Resume at layer %d of %d, Z %.3f mm" % (
                 info['layer'], info['layers'], info['layer_z']),
             "action:prompt_text Starts from: %s" % (info.get('resume_point', ''),),

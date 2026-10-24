@@ -45,13 +45,16 @@ different approach:
 
 3. **Find the layer.** The last `sd_pos` in `klippy.log` gives the layer directly. This
    matters: with a big babystep, the measured Z alone could point at the wrong layer.
-   If the log doesn't fit the measurement, it falls back to the layer nearest the
-   measured Z.
+   The logged position can be a little **behind** the nozzle (the last log lines never
+   reach the SD card when the host dies) or **ahead** of it (Klipper reads ahead of
+   the moves it is running), so close to a layer change the neighbouring layer that
+   fits the measured Z best is used. If the log doesn't fit the measurement at all, it
+   falls back to the layer nearest the measured Z.
 4. **Find the exact move.** Inside that layer, it picks the extruding move whose
-   **path** (the whole segment, not just its end points) passes closest to the measured
-   X/Y. The logged position is seconds **behind** the nozzle: the last log lines never
-   reach the SD card when the host dies, and the MCU keeps running its buffered moves.
-   So the search runs from shortly before the logged position to the end of the layer.
+   **path** (the whole segment or arc, not just its end points) passes closest to the
+   measured X/Y, searched from shortly before the logged position to the end of the
+   layer. When the move it was on and the next one both pass about as close (they
+   share an end point), it takes the earlier one: a little overlap, never a gap.
 5. **Recover the babystep.** `measured Z − layer Z` = the `SET_GCODE_OFFSET` that was
    active. The resume file re-applies it and resets it at the end.
 6. **Build the resume file** in its own folder (`gcodes/power_loss/`), where you can
@@ -59,12 +62,37 @@ different approach:
    1. checks the printer is homed
    2. sets the offset
    3. heats bed and nozzle while parked in a corner
-   4. primes, restores the extruder position and fan
-   5. moves above the resume point, lowers to the layer height
+   4. primes, restores the extruder position and fan, and the last acceleration
+      (`M204`, `SET_VELOCITY_LIMIT`) and `SET_PRESSURE_ADVANCE` the file had sent
+   5. moves above the resume point, lowers to the layer height, sets the print speed
+      the file was using there
    6. continues the original file from that move
-7. **Confirm and print.** A Mainsail popup shows the file, the layer, the resume point,
-   the move type (outer wall, infill, …, from Cura's `;TYPE:` labels) and the offset.
-   *Start print* builds the file and starts it.
+7. **Confirm and print.** A Mainsail popup shows the file, the slicer, the layer, the
+   resume point, the move type (outer wall, infill, … from the slicer's labels) and
+   the offset. *Start print* builds the file and starts it.
+
+### Slicers
+
+The slicer is read from the file header, and its layer markers and move-type labels
+are used:
+
+| Slicer | Layer markers | Move-type labels |
+|---|---|---|
+| Cura | `;LAYER:n` (Z is set before the marker) | `;TYPE:WALL-OUTER` |
+| PrusaSlicer, SuperSlicer | `;LAYER_CHANGE` + `;Z:0.6` | `;TYPE:External perimeter` |
+| OrcaSlicer, Creality Print | `;LAYER_CHANGE` + `;Z:0.6` | `;TYPE:Outer wall` |
+| Bambu Studio / Orca for Bambu printers | `; CHANGE_LAYER` + `; Z_HEIGHT: 0.6` | `; FEATURE: Outer wall` |
+| Simplify3D | `; layer 3, Z = 0.600` | `; feature outer perimeter` |
+
+A file with no layer markers at all still works: a layer starts at the first
+extrusion above everything printed so far (Z hops don't count). Arcs (`G2`/`G3`,
+e.g. PrusaSlicer's or Orca's arc fitting) are followed point by point, the way
+Klipper's `[gcode_arcs]` prints them.
+
+Tested on files from Cura 5.13 and PrusaSlicer 2.7 / 2.9 (with arcs, and a spiral
+vase), plus Orca, Bambu and marker-less copies of the PrusaSlicer file. Orca, Bambu,
+Creality Print and Simplify3D follow their documented formats but haven't been run on
+a real file from them yet - reports welcome.
 
 A measurement is only "fresh" until the next print starts, so an old crash's
 measurement can't be reused by mistake. Pressing the button again before printing
@@ -106,8 +134,8 @@ measurement only finds the unsaved part on top.
 - **Cartesian or CoreXY** kinematics with steppers named `stepper_x`, `stepper_y`,
   `stepper_z`. Only `stepper_z` is read, so multi-Z setups assume the Z motors stay
   in sync.
-- **Cura-style G-code** (`;LAYER:n` markers, Z set before each marker). Other slicers
-  would need their own layer parsing. Arcs (`G2`/`G3`) aren't handled yet.
+- **G-code from a common slicer** (see [Slicers](#slicers)); others fall back to
+  finding layers from the Z moves.
 
 ## Install
 
