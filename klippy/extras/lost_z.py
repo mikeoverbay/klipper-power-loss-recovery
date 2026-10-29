@@ -1,4 +1,5 @@
-# Power-loss / host-crash recovery for Klipper - no writes during the print.
+# Power-loss / host-crash recovery for Klipper - nothing written continuously
+# during the print (only the babystep and bed mesh, when they change).
 #
 # After a power cut or a frozen host the lead screws and belts don't move, so the
 # nozzle is still where it stopped. RECOVER_FROM_POWER_LOSS heats the nozzle in place
@@ -61,21 +62,88 @@ class LostZ:
         self.gcode.register_command('RESUME_AFTER_POWER_LOSS',
                                     self.cmd_RESUME_AFTER_POWER_LOSS,
                                     desc=self.cmd_RESUME_AFTER_POWER_LOSS_help)
+        self.gcode.register_command('_LOST_Z_RESTORE_MESH',
+                                    self.cmd_LOST_Z_RESTORE_MESH)
         self.autostart = False
+        self.was_active = False
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
 
     def _handle_ready(self):
         self.reactor.register_timer(self._watch_prints, self.reactor.NOW)
 
     def _watch_prints(self, eventtime):
-        # A measurement is only "fresh" until the next print starts; after
-        # that it belongs to an old crash and must be measured again.
-        if self.last.get('fresh'):
-            stats = self.printer.lookup_object('print_stats').get_status(eventtime)
-            if stats['state'] == 'printing':
-                self.last['fresh'] = False
+        stats = self.printer.lookup_object('print_stats').get_status(eventtime)
+        active = stats['state'] in ('printing', 'paused')
+        if active:
+            # A measurement is only "fresh" until the next print starts; after
+            # that it belongs to an old crash and must be measured again.
+            changed = bool(self.last.pop('fresh', False))
+            # Record the two things a power cut wipes that the measurement
+            # can't tell apart from the nozzle height: the babystep (Z gcode
+            # offset) and the bed mesh. Written only when they change - at
+            # the start and on each babystep - not continuously.
+            rec = self.last.get('print') or {}
+            if not self.was_active or rec.get('file') != stats['filename']:
+                rec = {'file': stats['filename'], 'started': time.time()}
+                changed = True
+            gcode_move = self.printer.lookup_object('gcode_move')
+            offset = round(gcode_move.get_status(eventtime)['homing_origin'][2], 4)
+            if rec.get('offset') != offset:
+                rec['offset'] = offset
+                changed = True
+            mesh_key, mesh = self._current_mesh()
+            if rec.get('mesh_key') != mesh_key or 'mesh' not in rec:
+                rec['mesh_key'], rec['mesh'] = mesh_key, mesh
+                changed = True
+            if changed:
+                self.last['print'] = rec
                 self._save_state()
-        return eventtime + 5.
+        self.was_active = active
+        return eventtime + 1.
+
+    def _current_mesh(self):
+        # (identity, record) of the active bed mesh; (None, None) if there
+        # isn't one. The record holds what's needed to rebuild it and to redo
+        # Klipper's fade maths later.
+        bed_mesh = self.printer.lookup_object('bed_mesh', None)
+        z_mesh = getattr(bed_mesh, 'z_mesh', None)
+        if z_mesh is None:
+            return None, None
+        key = "%s/%x" % (z_mesh.profile_name, id(z_mesh))
+        return key, {
+            'name': z_mesh.profile_name,
+            'params': dict(z_mesh.get_mesh_params()),
+            'points': [list(r) for r in z_mesh.get_probed_matrix()],
+            'offsets': list(getattr(z_mesh, 'mesh_offsets', [0., 0.])),
+            'fade_start': bed_mesh.fade_start, 'fade_end': bed_mesh.fade_end,
+            'fade_target': bed_mesh.fade_target,
+            'tool_offset': getattr(bed_mesh, 'tool_offset', 0.)}
+
+    def _build_mesh(self, rec):
+        from . import bed_mesh
+        z_mesh = bed_mesh.ZMesh(rec['params'], rec['name'])
+        z_mesh.build_mesh(rec['points'])
+        if hasattr(z_mesh, 'set_mesh_offsets'):
+            z_mesh.set_mesh_offsets(rec.get('offsets', [0., 0.]))
+        return z_mesh
+
+    def _mesh_adjust(self, rec, x, y, z):
+        # How much the mesh moved the nozzle at X/Y when the toolhead was at
+        # (physical) height z - the same sums as bed_mesh's get_position().
+        z_mesh = self._build_mesh(rec)
+        fade_start, fade_end = rec['fade_start'], rec['fade_end']
+        fade_target = rec['fade_target']
+        max_adj = z_mesh.calc_z(x, y)
+        z_adj = max_adj - fade_target
+        fade_z = z + rec.get('tool_offset', 0.)
+        factor = 1.
+        if min(fade_z, fade_z - max_adj) >= fade_end:
+            factor = 0.
+        elif max(fade_z, fade_z - max_adj) >= fade_start:
+            factor = ((fade_end + fade_target - fade_z)
+                      / ((fade_end - fade_start) - z_adj))
+            factor = min(1., max(0., factor))
+        return factor * z_adj + fade_target
 
     def _load_state(self):
         try:
@@ -159,10 +227,13 @@ class LostZ:
         z_after_home = toolhead.get_position()[2]
         travelled = (start_steps - end_steps) * stepper_z.get_step_dist()
         lost_z = z_after_home + travelled
+        # Keep what was recorded during the print (babystep, bed mesh).
+        keep = {k: self.last[k] for k in ('print', 'resume_mesh') if k in self.last}
         self.last = {'z': round(lost_z, 4), 'x': round(lost_x, 3),
                      'y': round(lost_y, 3), 'time': time.time(),
                      'start_steps': start_steps, 'end_steps': end_steps,
                      'z_after_home': z_after_home, 'fresh': True}
+        self.last.update(keep)
         self._save_state()
         # Don't leave a hot nozzle sitting on the bed corner.
         self.gcode.run_script_from_command("G90\nG1 Z5 F600")
@@ -260,9 +331,33 @@ class LostZ:
             args += ['--offset', '%.3f' % (offset,)]
         if line is not None:
             args += ['--line', str(line)]
-        if self.last.get('x') is not None and self.last.get('y') is not None:
-            args += ['--x', '%.3f' % (self.last['x'],), '--y', '%.3f' % (self.last['y'],)]
+        x, y = self.last.get('x'), self.last.get('y')
+        if x is not None and y is not None:
+            args += ['--x', '%.3f' % (x,), '--y', '%.3f' % (y,)]
+        # What was recorded during the print; the script only uses it if it is
+        # for the file being resumed.
+        rec = self.last.get('print') or {}
+        if rec.get('file'):
+            args += ['--record-file', rec['file'],
+                     '--babystep', '%.4f' % (rec.get('offset') or 0.,)]
+            if rec.get('mesh') and None not in (x, y, z):
+                try:
+                    adj = self._mesh_adjust(rec['mesh'], x, y, z)
+                except Exception as e:
+                    logging.exception("lost_z: bed mesh rebuild failed")
+                    raise gcmd.error("MAKE_RESUME_FILE: couldn't rebuild the bed mesh"
+                                     " recorded during the print (%s)" % (e,))
+                args += ['--mesh-adj', '%.4f' % (adj,)]
         if gcmd.get_int('CONFIRM', 0):
+            # The resume file's _LOST_Z_RESTORE_MESH puts back the mesh the
+            # print had - or none - if the record is for this file.
+            if fname and rec.get('file') == fname:
+                self.last['resume_mesh'] = (
+                    {'mode': 'set', 'mesh': rec['mesh']} if rec.get('mesh')
+                    else {'mode': 'clear'})
+            else:
+                self.last['resume_mesh'] = {'mode': 'keep'}
+            self._save_state()
             # Popup confirmed: build the file for real (and start it if this
             # came from the one-button flow).
             self.autostart = bool(gcmd.get_int('AUTOSTART', 0))
@@ -317,11 +412,13 @@ class LostZ:
         self.gcode.run_script(script + "SDCARD_PRINT_FILE FILENAME=%s" % (path,))
 
     def _resume_header(self, path):
+        # First line: what it resumes; the "Z offset ..." comment: the offset.
         try:
             with open(os.path.join(self.gcode_dir, path), errors='replace') as f:
-                first = f.readline().strip().lstrip('; ')
-                f.readline(); f.readline()
-                offset = f.readline().strip().lstrip('; ')
+                head = [f.readline() for _ in range(12)]
+            first = head[0].strip().lstrip('; ')
+            offset = next((l.strip().lstrip('; ') for l in head
+                           if l.startswith('; Z offset')), "")
             return first, offset
         except OSError:
             return None, None
@@ -434,6 +531,30 @@ class LostZ:
                                 " Confirm in the popup." % (
                                     info['file'], info['layer'],
                                     info['layer_z'], info['out_name']))
+
+    def cmd_LOST_Z_RESTORE_MESH(self, gcmd):
+        # Called by the resume file: the same bed mesh as the stopped print,
+        # rebuilt from the recorded probe points (so a mesh made in the start
+        # G-code works too), or no mesh if it had none.
+        want = self.last.get('resume_mesh') or {'mode': 'keep'}
+        bed_mesh = self.printer.lookup_object('bed_mesh', None)
+        if want['mode'] == 'keep':
+            return
+        if bed_mesh is None:
+            if want['mode'] == 'set':
+                raise gcmd.error("Resume file: the print used a bed mesh, but"
+                                 " there's no [bed_mesh] in the config now")
+            return
+        if want['mode'] == 'clear':
+            bed_mesh.set_mesh(None)
+            gcmd.respond_info("Resume: no bed mesh, as during the print")
+            return
+        rec = want['mesh']
+        bed_mesh.set_mesh(self._build_mesh(rec))
+        if hasattr(bed_mesh, 'tool_offset'):
+            bed_mesh.tool_offset = rec.get('tool_offset', 0.)
+        gcmd.respond_info("Resume: bed mesh %s restored as during the print"
+                          % (rec.get('name'),))
 
     def cmd_LOST_Z_PROMPT_END(self, gcmd):
         self._prompt(["action:prompt_end"])

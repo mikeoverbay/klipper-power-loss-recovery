@@ -1,14 +1,15 @@
 # Klipper power-loss & crash recovery
 
 Resume a print after a power cut or a frozen Klipper host. Nothing is written
-during the print. Instead, the printer **measures where the nozzle stopped**,
-and the add-on works out exactly where in the G-code that was.
+continuously during the print. Instead, the printer **measures where the nozzle
+stopped**, and the add-on works out exactly where in the G-code that was.
 
 - **One button** in Mainsail: *POWER LOSS RESUME*
 - Heats the nozzle **in place** first, so it lets go of the plastic it cooled in
 - Measures the stop point **X, Y and Z** by counting motor steps back to the endstops
 - Finds the **exact move** the nozzle was on (not just the layer)
-- Recovers your **babystep Z offset**
+- Recovers your **babystep Z offset**, keeps a **Z hop** out of it, and puts the
+  **bed mesh** the print had back
 - Shows one **confirmation popup** (file, layer, point, what it was printing, offset), then prints
 
 > **Status:** works on the author's Ender 3 Pro (SKR Mini E3 V2, optical Z endstop,
@@ -17,7 +18,7 @@ and the add-on works out exactly where in the G-code that was.
 
 ---
 
-## Why "no writes"?
+## Why (almost) "no writes"?
 
 Most power-loss scripts for Klipper save the position to the SD card every layer. On a
 Raspberry Pi that means constant small writes during every print. This add-on takes a
@@ -27,6 +28,10 @@ different approach:
   move, so the nozzle is still where it stopped.
 - **Klipper already logs enough.** Its `klippy.log` contains the print file position
   (`sd_pos`) about once a second. That's a normal log line, not something extra.
+- **Two things the measurement can't tell apart from the nozzle height are noted when
+  they change**, in `config/lost_z.json`: the Z gcode offset (babystep) and the active
+  bed mesh. That's one small write at the start of a print, one when a mesh is made
+  or loaded, and one per babystep - not a write every layer.
 
 ## How it works
 
@@ -55,12 +60,13 @@ different approach:
    measured X/Y, searched from shortly before the logged position to the end of the
    layer. When the move it was on and the next one both pass about as close (they
    share an end point), it takes the earlier one: a little overlap, never a gap.
-5. **Recover the babystep.** `measured Z − layer Z` = the `SET_GCODE_OFFSET` that was
-   active. The resume file re-applies it and resets it at the end.
+5. **Babystep, mesh, hop.** The recorded babystep and bed mesh are taken off the
+   measured Z, leaving the G-code Z - which tells a Z hop from a layer (see
+   [Babysteps, bed mesh and Z hops](#babysteps-bed-mesh-and-z-hops)).
 6. **Build the resume file** in its own folder (`gcodes/power_loss/`), where you can
    see it in Mainsail. The last measurement is saved in `config/lost_z.json`. The file:
    1. checks the printer is homed
-   2. sets the offset
+   2. sets the offset and puts the print's bed mesh back (or none)
    3. heats bed and nozzle while parked in a corner
    4. primes, restores the extruder position and fan, and the last acceleration
       (`M204`, `SET_VELOCITY_LIMIT`) and `SET_PRESSURE_ADVANCE` the file had sent
@@ -98,42 +104,65 @@ A measurement is only "fresh" until the next print starts, so an old crash's
 measurement can't be reused by mistake. Pressing the button again before printing
 won't re-measure the parked corner.
 
-### Unsaved Z offsets (babysteps)
+### Babysteps, bed mesh and Z hops
 
-A babystep made during a print (Mainsail's Z +/- buttons, `SET_GCODE_OFFSET`) lives
-only in memory. A power cut or restart wipes it, so without help the resume would
-come back at the wrong squish. Nothing is saved during the print; it is worked out
-afterwards:
+The measured Z is the real nozzle height. Three things besides the layer go into it,
+and a power cut wipes the first two from memory:
 
-1. **Measured Z is the real nozzle height**, babystep included - it comes from the
-   Z motor steps, and the lead screws don't move when the power goes.
-2. **The G-code gives the height it should have been**: the layer (from the logged
-   file position) and that layer's Z, e.g. 12.40.
-3. **The difference is the babystep**: measured 12.35 − layer 12.40 = −0.05.
-4. **Clean-up**: rounded to 0.005 mm (Mainsail's smallest babystep, and about the
-   measuring accuracy) and only accepted if it's a believable babystep - up to ±1 mm
-   when the log gives the layer, ±0.15 mm when the layer had to be guessed from the
-   height (a bigger difference could then just mean the wrong layer).
+```
+measured Z = G-code Z + babystep + bed mesh correction at X/Y (faded with height)
+```
 
-The resume file sends `SET_GCODE_OFFSET Z=<offset>` before it prints and resets it
-to 0 at the end, so the next print doesn't inherit it.
+- **Babystep** (Mainsail's Z +/- buttons, any `SET_GCODE_OFFSET`): recorded in
+  `lost_z.json` each time it changes during the print.
+- **Bed mesh**: the active mesh (its probe points, settings and fade) is recorded when
+  it appears - loaded from a profile *or* made by `BED_MESH_CALIBRATE` in the start
+  G-code. The correction at the measured X/Y is worked out with the same maths as
+  Klipper's `bed_mesh`, and taken off.
+- **What's left is the G-code Z** the nozzle was at. That is matched together with
+  X/Y against every move around the logged position - travels and Z moves included.
+  So a stop **during a Z hop** is found as the hop (the popup says "during a 0.20 mm Z
+  hop") instead of being read as a layer higher up, or as a +0.2 mm babystep.
+
+The resume file sends the recorded babystep (`SET_GCODE_OFFSET Z=...`) and resets it
+to 0 at the end. It puts the **same bed mesh** back (`_LOST_Z_RESTORE_MESH` rebuilds it
+from the recorded points, so an adaptive mesh made at print start works too), or
+clears the mesh if the print had none - Klipper may have loaded a default one at
+start-up.
+
+A hop exactly as high as a layer is the hard case: hopping at 0.2 mm over a spot is
+the same X/Y/Z as printing the next 0.2 mm layer there. The logged file position
+decides which; without it, the **lower** layer is taken, so the worst case is a short
+overlap rather than a missing piece of layer.
+
+**If nothing was recorded** (an older install, or a cut within a second of the print
+starting), it falls back to: babystep = measured Z − the matched move's G-code Z,
+rounded to 0.005 mm and only accepted if it's a believable babystep - up to ±1 mm
+when the log gives the position, ±0.15 mm when it doesn't. A mesh can't be separated
+from the babystep that way.
 
 A **saved** Z offset (`Z_OFFSET_APPLY_ENDSTOP` / `SAVE_CONFIG`) needs nothing extra:
-it is part of the endstop position, so homing already includes it, and the
-measurement only finds the unsaved part on top.
+it is part of the endstop position, so homing already includes it.
 
 ## Requirements
 
 - **Klipper + Moonraker**, and **Mainsail** for the popups (any client that supports
   `action:prompt` should work).
-- **A Z endstop at the bottom of travel that the gantry triggers** (mechanical or
-  optical switch). **Not** a bed probe used as the Z endstop with `safe_z_home` at the
-  bed centre: homing there would drive the nozzle into the part.
+- **A Z endstop the gantry triggers** (mechanical or optical switch), with the X/Y
+  home corner clear of the part. Z-max homing should work too (the measurement only
+  counts steps to the endstop, and homing moves away from the part) but is untested.
+  **Not** a bed probe used as the Z endstop with `safe_z_home` at the bed centre:
+  homing there would drive the nozzle into the part.
 - **Axes that hold still with the power off:** lead-screw Z, normal belts. Don't touch
-  the head after a power cut; the X/Y motors are unpowered.
+  the head after a power cut; the X/Y motors are unpowered. A belt-driven Z that drops
+  without power won't work.
 - **Cartesian or CoreXY** kinematics with steppers named `stepper_x`, `stepper_y`,
-  `stepper_z`. Only `stepper_z` is read, so multi-Z setups assume the Z motors stay
-  in sync.
+  `stepper_z`. Several Z motors are fine if they home together or square against
+  their own endstops (homing does what it did at the start of the print). Only
+  `stepper_z` is counted, so the height is measured on its side. **Not supported:**
+  machines that need `Z_TILT_ADJUST` or `QUAD_GANTRY_LEVEL` before printing - those
+  probe the bed, which can't be redone with a part on it.
+- **A bed mesh is fine** - it's recorded and restored (see above).
 - **G-code from a common slicer** (see [Slicers](#slicers)); others fall back to
   finding layers from the Z moves.
 

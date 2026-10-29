@@ -14,7 +14,7 @@
 #
 # Copyright (C) 2026 mikeoverbay
 # SPDX-License-Identifier: GPL-3.0-or-later
-import argparse, glob, json, math, os, re, sys, urllib.request
+import argparse, bisect, glob, json, math, os, re, sys, urllib.request
 
 Z_MAX = 250.
 MAX_OFFSET = 0.15     # without the log, offsets past ~half a layer are ambiguous
@@ -25,6 +25,8 @@ MAX_LOG_OFFSET = 1.0  # with the layer known from klippy.log, allow real babyste
 EXACT_BACK = 300      # lines before the logged file position to also search
 NEAR_TIE = 0.3        # mm; passes this close to the best count as a tie
 TIE_BACK = 30         # lines; among ties this far back, start at the earliest
+Z_TIE = 0.05          # mm; moves this close to the best Z also count as a tie
+HOP_MAX = 2.0         # mm; highest Z hop looked for when the log gives no position
 EXACT_MAX_DIST = 2.0  # mm; farther than this from every move -> fall back to the layer start
 OFFSET_STEP = 0.005   # Mainsail's smallest babystep; also ~ the measuring accuracy
 ARC_STEP = 0.5        # mm; arcs are checked as chords about this long
@@ -128,12 +130,18 @@ def line_at_byte(path, pos):
     with open(path, 'rb') as f:
         return f.read(pos).count(b'\n')
 
-def find_crash_move(path, first_idx, last_idx, x, y, near_idx=None):
-    # Pick the extruding move between first_idx and last_idx whose path
-    # (the whole segment, not just its end points) passes closest to the
-    # measured X/Y. If several passes are about as close, take the one nearest
-    # near_idx (the logged file position).
+def find_crash_move(path, first_idx, last_idx, x, y, near_idx=None, z=None,
+                    layers=None):
+    # Pick the move between first_idx and last_idx whose path (the whole
+    # segment or arc, not just its end points) passes closest to the measured
+    # X/Y - and, when z (the G-code Z the nozzle was at) is given, at that
+    # height. Travels and Z moves count too, so a stop during a Z hop is found
+    # as the hop, not mistaken for a layer higher up. Extruding moves win
+    # ties. If several are about as close, the one nearest near_idx (the
+    # logged file position) anchors the pick.
+    # Returns (xy distance, line, start x, start y, start z, extrudes, z distance).
     cx = cy = None
+    cz = 0.
     e_abs, e_last = True, 0.
     cands = []
     with open(path, errors='replace') as f:
@@ -153,25 +161,50 @@ def find_crash_move(path, first_idx, last_idx, x, y, near_idx=None):
                 if v is not None:
                     e_last = v
             elif cmd in MOVES:
-                nx, ny, e = param(line, 'X'), param(line, 'Y'), param(line, 'E')
+                nx, ny, nz, e = (param(line, 'X'), param(line, 'Y'),
+                                 param(line, 'Z'), param(line, 'E'))
                 nx = cx if nx is None else nx
                 ny = cy if ny is None else ny
+                nz = cz if nz is None else nz
                 extrudes = e is not None and (e > e_last if e_abs else e > 0)
-                if (idx >= first_idx and extrudes and None not in (cx, cy, nx, ny)):
+                moved = (nx, ny, nz) != (cx, cy, cz)
+                if idx >= first_idx and moved and None not in (cx, cy, nx, ny):
                     if cmd in ('G2', 'G3'):
                         pts = arc_points(line, cmd == 'G2', cx, cy, nx, ny)
                     else:
                         pts = [(cx, cy), (nx, ny)]
                     d = min(seg_dist(x, y, ax, ay, bx, by)
                             for (ax, ay), (bx, by) in zip(pts, pts[1:]))
-                    cands.append((d, idx, cx, cy))
+                    if z is None:
+                        dz = 0.
+                    else:
+                        lo, hi = min(cz, nz), max(cz, nz)
+                        dz = max(0., lo - z, z - hi)
+                    if extrudes or z is not None:
+                        cands.append((d, idx, cx, cy, cz, extrudes, dz))
                 if e is not None:
                     e_last = e if e_abs else e_last + e
-                cx, cy = nx, ny
+                cx, cy, cz = nx, ny, nz
     if not cands:
         return None
     dmin = min(c[0] for c in cands)
     close = [c for c in cands if c[0] <= dmin + NEAR_TIE]
+    dzmin = min(c[6] for c in close)
+    close = [c for c in close if c[6] <= dzmin + Z_TIE]
+    # Settle the layer first. A Z hop as high as a layer (or two) matches the
+    # next layer's moves at the same X/Y/Z, so: with a logged position, the
+    # layer of the match nearest it; without one, the lower layer - redoing a
+    # bit overlaps, the higher one would leave the rest of the layer out.
+    starts = [l[1] for l in layers] if layers else []
+    layer_of = lambda c: bisect.bisect_right(starts, c[1])
+    if near_idx is not None:
+        pick = layer_of(min(close, key=lambda c: abs(c[1] - near_idx)))
+    else:
+        pick = min(layer_of(c) for c in close)
+    close = [c for c in close if layer_of(c) == pick]
+    # Within the layer, extruding moves win ties over travels.
+    if any(c[5] for c in close):
+        close = [c for c in close if c[5]]
     if near_idx is not None:
         anchor = min(close, key=lambda c: abs(c[1] - near_idx))
     else:
@@ -371,6 +404,12 @@ def main():
                     help="don't use klippy.log's file position to find the layer")
     ap.add_argument('--offset', type=float,
                     help="babystep Z offset to apply (default: measured Z - layer Z)")
+    ap.add_argument('--record-file',
+                    help="file lost_z.py recorded the babystep / mesh for")
+    ap.add_argument('--babystep', type=float,
+                    help="Z offset recorded during that print")
+    ap.add_argument('--mesh-adj', type=float,
+                    help="bed mesh Z correction at the measured X/Y during that print")
     ap.add_argument('--preview', action='store_true',
                     help="only report what would be made, as one JSON line")
     a = ap.parse_args()
@@ -396,6 +435,18 @@ def main():
     pos = a.pos if a.pos is not None else (crash_file_pos(a.log_dir) if a.use_log else None)
     if pos is not None and pos > os.path.getsize(path):
         pos = None
+    crash_line = line_at_byte(path, pos) if pos is not None else None
+    # What lost_z.py recorded while this file printed: the babystep that was
+    # in effect, and the bed mesh correction at the measured X/Y (already
+    # worked out). Only trusted if the record is for this very file.
+    rec = a.record_file is not None and a.record_file == fname
+    babystep = a.babystep if rec else None
+    z_in = None if a.z is None else a.z - ((a.mesh_adj or 0.) if rec else 0.)
+    # The G-code Z the nozzle was at. Without a recorded babystep, assume 0:
+    # a babystep is small next to a layer or a Z hop.
+    z_cmd = None if z_in is None else z_in - (babystep or 0.)
+    from_log = crash_line is not None
+    match = None
     if a.line is not None:
         # Start line already chosen by the preview: use its layer as-is.
         a.layer = [l for l in layers if l[1] <= a.line][-1][0]
@@ -404,55 +455,87 @@ def main():
         if not pick:
             raise SystemExit("Layer %d not in file (0-%d)" % (a.layer, layers[-1][0]))
         target = pick[0]
-        if a.z is None:
+        from_log = False
+        if z_in is None:
             note = "layer chosen by hand"
         else:
             note = "measured Z %.3f, layer Z %.3f (diff %+.3f mm)" % (
-                a.z, target[2], a.z - target[2])
+                z_in, target[2], z_in - target[2])
     else:
         if a.z is None:
             raise SystemExit("Need --z or --layer")
-        # Best source: the file position Klipper logged when it died. That
-        # gives the layer directly, so any babystep size can be recovered.
-        log_layer = None
-        if pos is not None:
-            cand = layer_at_byte(path, layers, pos)
-            # The logged spot can be on the wrong side of a layer change:
-            # ahead of the nozzle (Klipper reads ahead) or behind it (the last
-            # log lines never reached the card). Near a layer change, take
-            # whichever neighbouring layer the measured Z fits best.
-            if cand is not None:
-                crash_at = line_at_byte(path, pos)
-                k = layers.index(cand)
-                # this layer, and any layer starting within EXACT_BACK lines
-                # (small parts can have several layers in that many lines)
-                near = [cand] + [l for i, l in enumerate(layers) if i != k
-                                 and abs(l[1] - crash_at) <= EXACT_BACK]
-                if k > 0 and crash_at - cand[1] <= EXACT_BACK:
-                    near.append(layers[k - 1])
-                cand = min(near, key=lambda l: abs(a.z - l[2]))
-            if cand is not None and abs(a.z - cand[2]) <= MAX_LOG_OFFSET:
-                log_layer = cand
-        if log_layer is not None:
-            target = log_layer
-            from_log = True
-            note = ("crashed in layer %d per klippy.log (file byte %d); measured Z"
-                    " %.3f vs layer Z %.3f" % (target[0], pos, a.z, target[2]))
-        else:
-            from_log = False
-            target = min(layers, key=lambda l: abs(l[2] - a.z))
-            note = "nearest layer to measured Z %.3f is Z %.3f (diff %+.3f mm)" % (
-                a.z, target[2], a.z - target[2])
+        target = None
+        if a.x is not None and a.y is not None:
+            # Look for the move it stopped on, matching X, Y and Z: around the
+            # logged position (which can be a little ahead of or behind the
+            # nozzle, across a layer change), or with no log through every
+            # layer the measured Z could belong to, a Z hop included.
+            if crash_line is not None:
+                w0 = max(0, crash_line - EXACT_BACK)
+                after = [l for l in layers if l[1] > crash_line + EXACT_BACK]
+                w1 = after[0][1] - 1 if after else 10 ** 9
+            else:
+                zs = [l for l in layers
+                      if z_cmd - HOP_MAX - MAX_OFFSET <= l[2] <= z_cmd + MAX_OFFSET]
+                w0 = zs[0][1] if zs else None
+                after = [l for l in layers if zs and l[1] > zs[-1][1]]
+                w1 = after[0][1] - 1 if after else 10 ** 9
+            if w0 is not None:
+                best = find_crash_move(path, w0, w1, a.x, a.y, crash_line, z_cmd,
+                                       layers)
+                z_ok = 0.1 if babystep is not None else (
+                    MAX_LOG_OFFSET if from_log else MAX_OFFSET)
+                if best is not None and best[0] <= EXACT_MAX_DIST and best[6] <= z_ok:
+                    match = best
+                    target = [l for l in layers if l[1] <= best[1]][-1] \
+                        if best[1] >= layers[0][1] else layers[0]
+                    note = "stopped in layer %d at file line %d%s" % (
+                        target[0], best[1] + 1,
+                        " (klippy.log file byte %d)" % (pos,) if from_log else "")
+                    hop = best[4] - target[2]
+                    if not best[5] and hop > 0.05:
+                        note += ", during a %.2f mm Z hop" % (hop,)
+        if target is None:
+            # No X/Y match: the layer from the logged position, or the layer
+            # nearest the measured Z.
+            log_layer = None
             if pos is not None:
-                note += " - klippy.log position didn't match this Z, not used"
-            if abs(a.z - target[2]) > 0.15:
-                note += " - WARNING: not close to any layer, check before printing"
-    # The babystep Z offset that was in effect: the nozzle physically sat at
-    # layer Z + offset, so measured Z minus the stopped layer's Z gives it back.
+                cand = layer_at_byte(path, layers, pos)
+                if cand is not None:
+                    k = layers.index(cand)
+                    near = [cand] + [l for i, l in enumerate(layers) if i != k
+                                     and abs(l[1] - crash_line) <= EXACT_BACK]
+                    if k > 0 and crash_line - cand[1] <= EXACT_BACK:
+                        near.append(layers[k - 1])
+                    cand = min(near, key=lambda l: abs(z_cmd - l[2]))
+                if cand is not None and abs(z_cmd - cand[2]) <= MAX_LOG_OFFSET:
+                    log_layer = cand
+            if log_layer is not None:
+                target = log_layer
+                note = ("crashed in layer %d per klippy.log (file byte %d); Z %.3f"
+                        " vs layer Z %.3f" % (target[0], pos, z_in, target[2]))
+            else:
+                from_log = False
+                target = min(layers, key=lambda l: abs(l[2] - z_cmd))
+                note = "nearest layer to Z %.3f is Z %.3f (diff %+.3f mm)" % (
+                    z_in, target[2], z_in - target[2])
+                if pos is not None:
+                    note += " - klippy.log position didn't match this Z, not used"
+                if abs(z_cmd - target[2]) > 0.15:
+                    note += " - WARNING: not close to any layer, check before printing"
+    if rec and a.mesh_adj:
+        note += "; bed mesh at that spot (%+.3f mm) taken off" % (a.mesh_adj,)
+    # The babystep Z offset: recorded during the print if possible, otherwise
+    # the measured height minus the G-code Z of the move it stopped on (that
+    # move's own Z, so a Z hop isn't mistaken for a babystep).
     if a.offset is not None:
         offset, offset_note = a.offset, "Z offset %+.3f mm (as checked)" % (a.offset,)
-    elif a.z is not None:
-        raw = a.z - target[2]
+    elif babystep is not None:
+        offset = babystep
+        offset_note = "Z offset recorded during the print: %+.3f mm (will be applied)" % (
+            offset,)
+    elif z_in is not None:
+        raw = z_in - (match[4] if match is not None else target[2])
         limit = MAX_LOG_OFFSET if (a.layer is None and from_log) else MAX_OFFSET
         if abs(raw) > limit:
             offset = 0.
@@ -470,34 +553,24 @@ def main():
         target = later[0]
     layer, start_idx, layer_z = target
 
-    # Exact: inside the layer, start from the move that passes closest to the
-    # measured X/Y, searched just before where the log says it stopped.
+    # Exact: start from the move it stopped on (found above).
     resume_point = "start of layer %d" % (layer,)
     mode_used = 'next' if a.mode == 'next' else 'redo'
     if a.mode == 'exact':
-        later = [l for l in layers if l[1] > start_idx]
-        layer_end = later[0][1] - 1 if later else 10 ** 9
         if a.line is not None:
             start_idx, mode_used = a.line, 'exact'
             resume_point = "file line %d (as checked)" % (a.line + 1,)
         elif a.x is None or a.y is None:
             resume_point += " (no measured X/Y, so whole layer redone)"
+        elif match is not None:
+            start_idx, mode_used = match[1], 'exact'
+            resume_point = ("X%.2f Y%.2f, file line %d (%.2f mm from the measured"
+                            " spot)" % (match[2], match[3], match[1] + 1, match[0]))
+            if not match[5]:
+                resume_point += ", a travel move"
         else:
-            crash_line = line_at_byte(path, pos) if pos is not None else None
-            # (the logged spot may be just outside this layer, see above)
-            if crash_line is not None and \
-                    start_idx - EXACT_BACK <= crash_line <= layer_end + EXACT_BACK:
-                first = max(start_idx, min(crash_line, layer_end) - EXACT_BACK)
-            else:
-                crash_line, first = None, start_idx
-            best = find_crash_move(path, first, layer_end, a.x, a.y, crash_line)
-            if best is not None and best[0] <= EXACT_MAX_DIST:
-                start_idx, mode_used = best[1], 'exact'
-                resume_point = ("X%.2f Y%.2f, file line %d (%.2f mm from the measured"
-                                " spot)" % (best[2], best[3], best[1] + 1, best[0]))
-            else:
-                resume_point += (" (no move within %.0f mm of X%.2f Y%.2f, so whole"
-                                 " layer redone)" % (EXACT_MAX_DIST, a.x, a.y))
+            resume_point += (" (no move within %.0f mm of X%.2f Y%.2f, so whole"
+                             " layer redone)" % (EXACT_MAX_DIST, a.x, a.y))
 
     base = os.path.basename(fname)
     if a.name:
@@ -527,7 +600,10 @@ def main():
             'layers': layers[-1][0], 'layer_z': layer_z, 'note': note,
             'offset': round(offset, 3), 'offset_note': offset_note,
             'mode': mode_used, 'line': start_idx, 'resume_point': resume_point,
-            'move_type': move_type_at(path, start_idx),
+            'move_type': ("travel move" if mode_used == 'exact' and match is not None
+                          and not match[5] else move_type_at(path, start_idx)),
+            'recorded': rec, 'babystep': babystep,
+            'mesh_adj': a.mesh_adj if rec else None,
             'out_name': out_name, 'out_exists': os.path.exists(out_path)}))
         return
 
@@ -545,6 +621,8 @@ def main():
         "; Original sliced with %s; layers found from %s" % (slicer, layers_how),
         "_LOST_Z_CHECK_HOMED",
         "; %s" % (offset_note,),
+        # Put back the bed mesh the print had (or none), as lost_z recorded it.
+        "_LOST_Z_RESTORE_MESH",
         ("SET_GCODE_OFFSET Z=%.3f MOVE=0" % (offset,)) if offset
         else "SET_GCODE_OFFSET Z=0 MOVE=0",
         "M140 S%g" % st['bed'],
@@ -570,9 +648,12 @@ def main():
     if st['flow']:
         head.append("M221 S%g" % st['flow'])
     head += [st['keep'][c] for c in KEEP_CMDS if c in st['keep']]
+    # Mid-layer, go down to the Z the file had at that move (a Z hop, or a
+    # spiral vase's rising Z); for a whole layer, to the layer height.
+    go_z = st['z'] if mode_used == 'exact' and st['z'] is not None else layer_z
     head += [
         "G0 X%.3f Y%.3f F6000 ; above the resume point" % (st['x'], st['y']),
-        "G0 Z%.3f F600 ; down to layer height" % layer_z,
+        "G0 Z%.3f F600 ; down to the file's Z there" % go_z,
         # G-code speeds carry over, so the file's next moves may rely on an F
         # set before this point - put it back instead of leaving F600.
         ("G1 F%g ; print speed the file had here" % st['feed']) if st['feed']
